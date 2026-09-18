@@ -104,7 +104,7 @@ print_license() {
 Shimboot ${shimboot_version}${suffix}
 
 ading2210/shimboot: Boot desktop Linux from a Chrome OS RMA shim.
-Copyright (C) 2023 ading2210
+Copyright (C) 2025 ading2210
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -294,7 +294,13 @@ boot_target() {
 
   echo "moving mounts to newroot"
   mkdir /newroot
-  mount $target /newroot
+  #use cryptsetup to check if the rootfs is encrypted
+  if [ -x "$(command -v cryptsetup)" ] && cryptsetup luksDump "$target" >/dev/null 2>&1; then
+    cryptsetup open $target rootfs
+    mount /dev/mapper/rootfs /newroot
+  else
+    mount $target /newroot
+  fi
   #bind mount /dev/console to show systemd boot msgs
   if [ -f "/bin/frecon-lite" ]; then 
     rm -f /dev/console
@@ -329,7 +335,6 @@ boot_chromeos() {
   local donor_files="/newroot/tmp/donor"
   mkdir -p $donor_mount
   mount -o ro $donor $donor_mount
-
   echo "copying modules and firmware to tmpfs (this may take a while)"
   copy_progress $donor_mount/lib/modules $donor_files/lib/modules
   copy_progress $donor_mount/lib/firmware $donor_files/lib/firmware

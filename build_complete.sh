@@ -13,8 +13,9 @@ print_help() {
   echo "                   gnome, xfce, kde, lxde, gnome-flashback, cinnamon, mate, lxqt"
   echo "  data_dir     - The working directory for the scripts. This defaults to ./data"
   echo "  arch         - The CPU architecture to build the shimboot image for. Set this to 'arm64' if you have an ARM Chromebook."
-  echo "  release      - Set this to either 'bookworm' or 'unstable' to build for Debian stable/unstable."
+  echo "  release      - Set this to either 'bookworm', 'trixie', or 'unstable' to build for Debian 12, 13, or unstable."
   echo "  distro       - The Linux distro to use. This should be either 'debian', 'ubuntu', or 'alpine'."
+  echo "  luks         - Set this argument to encrypt the rootfs partition."
 }
 
 assert_root
@@ -32,6 +33,7 @@ data_dir="${args['data_dir']}"
 arch="${args['arch']-amd64}"
 release="${args['release']}"
 distro="${args['distro']-debian}"
+luks="${args['luks']}"
 
 #a list of all arm board names
 arm_boards="
@@ -40,7 +42,8 @@ arm_boards="
   kukui peach-pi peach-pit stumpy daisy-spring trogdor
 "
 #a list of shims that have a patch for the sh1mmer vulnerability
-bad_boards="reef sand snappy pyro"
+bad_boards="reef sand pyro"
+
 if grep -q "$board" <<< "$arm_boards" > /dev/null; then
   print_info "automatically detected arm64 device name"
   arch="arm64"
@@ -48,6 +51,11 @@ fi
 if grep -q "$board" <<< "$bad_boards" > /dev/null; then
   print_error "Warning: you are attempting to build Shimboot for a board which has a shim that includes a fix for the sh1mmer vulnerability. The resulting image will not boot if you are enrolled."
   read -p "Press [enter] to continue "
+fi
+
+if [[ "$luks" == "true" && "$arch" == "arm64" ]]; then
+  print_error "Uh-oh, you are trying to use luks2 encryption on an arm64 board. Unfortunately, rootfs encryption is not available on arm64-based boards at this time. :("
+  exit
 fi
 
 kernel_arch="$(uname -m)"
@@ -58,12 +66,12 @@ elif [ "$kernel_arch" = "aarch64" ]; then
   host_arch="arm64"
 fi
 
-needed_deps="wget python3 unzip zip git debootstrap cpio binwalk pcregrep cgpt mkfs.ext4 mkfs.ext2 fdisk depmod findmnt lz4 pv"
+needed_deps="wget python3 unzip zip git debootstrap cpio binwalk pcregrep cgpt mkfs.ext4 mkfs.ext2 fdisk depmod findmnt lz4 pv cryptsetup"
 if [ "$(check_deps "$needed_deps")" ]; then
   #install deps automatically on debian and ubuntu
   if [ -f "/etc/debian_version" ]; then
     print_title "attempting to install build deps"
-    apt-get install wget python3 unzip zip debootstrap cpio binwalk pcregrep cgpt kmod pv lz4 -y
+    apt-get install wget python3 unzip zip debootstrap cpio binwalk pcregrep cgpt kmod pv lz4 cryptsetup -y
   fi
   assert_deps "$needed_deps"
 fi
@@ -90,7 +98,7 @@ sigint_handler() {
 }
 trap sigint_handler SIGINT
 
-shim_url="https://dl.darkn.bio/api/raw/?path=/SH1mmer/$board.zip"
+shim_url="" #set this if you want to download from a third party mirror
 boards_url="https://chromiumdash.appspot.com/cros/fetch_serving_builds?deviceCategory=ChromeOS"
 
 if [ -z "$data_dir" ]; then
@@ -123,9 +131,25 @@ print_info "found url: $reco_url"
 
 shim_bin="$data_dir/shim_$board.bin"
 shim_zip="$data_dir/shim_$board.zip"
+shim_dir="$data_dir/shim_${board}_chunks"
 reco_bin="$data_dir/reco_$board.bin"
 reco_zip="$data_dir/reco_$board.zip"
 mkdir -p "$data_dir"
+
+extract_zip() {
+  local zip_path="$1"
+  local bin_path="$2"
+  cleanup_path="$bin_path"
+  print_info "extracting $zip_path"
+  local total_bytes="$(unzip -lq "$zip_path" | tail -1 | xargs | cut -d' ' -f1)"
+  if [ ! "$quiet" ]; then
+    unzip -p "$zip_path" | pv -s "$total_bytes" > "$bin_path"
+  else
+    unzip -p "$zip_path" > "$bin_path"
+  fi
+  rm -rf "$zip_path"
+  cleanup_path=""
+}
 
 download_and_unzip() {
   local url="$1"
@@ -133,23 +157,63 @@ download_and_unzip() {
   local bin_path="$3"
   if [ ! -f "$bin_path" ]; then
     if [ ! "$quiet" ]; then
-      wget -q --show-progress $url -O $zip_path -c
+      wget -q --show-progress $url -O "$zip_path" -c
     else
-      wget -q $url -O $zip_path -c
+      wget -q "$url" -O "$zip_path" -c
     fi
   fi
 
   if [ ! -f "$bin_path" ]; then
-    cleanup_path="$bin_path"
-    print_info "extracting $zip_path"
-    local total_bytes="$(unzip -lq $zip_path | tail -1 | xargs | cut -d' ' -f1)"
-    if [ ! "$quiet" ]; then
-      unzip -p $zip_path | pv -s $total_bytes > $bin_path
-    else
-      unzip -p $zip_path > $bin_path
+    extract_zip "$zip_path" "$bin_path"
+  fi
+}
+
+download_shim() {
+  print_info "downloading shim file manifest"
+  local boards_index="$(curl --no-progress-meter "https://cdn.cros.download/boards.txt")"
+  local shim_url_path="$(echo "$boards_index" | grep "/$board/").manifest"
+  local shim_url_dir="$(dirname "$shim_url_path")"
+  local shim_manifest="$(curl --no-progress-meter "https://cdn.cros.download/$shim_url_path")"
+  local py_load_json="import json, sys; manifest = json.load(sys.stdin)"
+
+  local zip_size="$(echo "$shim_manifest" | python3 -c "$py_load_json; print(manifest['size'])")"
+  local zip_size_pretty="$(echo "$zip_size" | numfmt --format %.2f --to=iec)"
+  local shim_chunks="$(echo "$shim_manifest" | python3 -c "$py_load_json; print('\\n'.join(manifest['chunks']))")"
+  local chunk_count="$(echo "$shim_chunks" | wc -l)"
+  local chunk_size="$((25 * 1024 * 1024))"
+
+  print_info "downloading shim file chunks (total $zip_size_pretty across $chunk_count chunks)"
+  mkdir -p "$shim_dir"
+  local i="0"
+  for shim_chunk in $shim_chunks; do
+    local chunk_url="https://cdn.cros.download/$shim_url_dir/$shim_chunk"
+    local chunk_path="$shim_dir/$shim_chunk"
+    local i="$(($i + 1))"
+    if [ -f "$chunk_path" ]; then
+      local existing_size="$(du -b "$chunk_path" | cut -f1)"
+      if [ "$existing_size" = "$chunk_size" ]; then
+        continue
+      fi
     fi
-    rm -rf $zip_path
-    cleanup_path=""
+    print_info "downloading chunk $i / $chunk_count"
+    if [ ! "$quiet" ]; then
+      wget -c -q --show-progress "$chunk_url" -O "$chunk_path"
+    else
+      wget -c -q "$chunk_url" -O "$chunk_path"
+    fi
+  done
+
+  print_info "joining shim file chunks"
+  cleanup_path="$shim_zip"
+  if [ ! -f "$shim_bin" ]; then
+    cat "$shim_dir/"* | pv -s "$zip_size" > "$shim_zip"
+    rm -rf "$shim_dir"
+  fi
+  cleanup_path=""
+
+  print_info "extracting shim file"
+  if [ ! -f "$shim_bin" ]; then
+    extract_zip "$shim_zip" "$shim_bin"
   fi
 }
 
@@ -161,10 +225,16 @@ retry_cmd() {
 }
 
 print_title "downloading recovery image"
-download_and_unzip $reco_url $reco_zip $reco_bin
+download_and_unzip "$reco_url" "$reco_zip" "$reco_bin"
 
 print_title "downloading shim image"
-download_and_unzip $shim_url $shim_zip $shim_bin
+if [ ! -f "$shim_bin" ]; then
+  if [ "$shim_url" ]; then
+    download_and_unzip "$shim_url" "$shim_zip" "$shim_bin"
+  else
+    download_shim "$shim_url" "$shim_zip" "$shim_bin"
+  fi
+fi
 
 print_title "building $distro rootfs"
 if [ ! "$rootfs_dir" ]; then
@@ -208,13 +278,13 @@ if [ ! "$rootfs_dir" ]; then
     distro=$distro
 fi
 
-print_title "patching debian rootfs"
+print_title "patching $distro rootfs"
 retry_cmd ./patch_rootfs.sh $shim_bin $reco_bin $rootfs_dir "quiet=$quiet"
 
 print_title "building final disk image"
 final_image="$data_dir/shimboot_$board.bin"
 rm -rf $final_image
-retry_cmd ./build.sh $final_image $shim_bin $rootfs_dir "quiet=$quiet" "arch=$arch" "name=$distro"
+retry_cmd ./build.sh $final_image $shim_bin $rootfs_dir "quiet=$quiet" "arch=$arch" "name=$distro" "luks=$luks"
 print_info "build complete! the final disk image is located at $final_image"
 
 print_title "cleaning up"
