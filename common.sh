@@ -32,9 +32,13 @@ assert_deps() {
   fi
 }
 
-parse_args() {
-  declare -g -A args
-  for argument in "$@"; do
+   declare -A args   # top level, before parse_args
+
+   parse_args() {
+     for argument in "$@"; do
+       ...
+     done
+   }
     if [ "$argument" = "-h" ] || [ "$argument" = "--help" ]; then
       print_help
       exit 0
