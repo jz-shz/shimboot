@@ -34,19 +34,21 @@ assert_deps() {
 
    declare -A args   # top level, before parse_args
 
-parse_args() {
-  for argument in "$@"; do
+   parse_args() {
+     for argument in "$@"; do
+       ...
+     done
+   }
     if [ "$argument" = "-h" ] || [ "$argument" = "--help" ]; then
       print_help
       exit 0
     fi
 
-    key=$(echo "$argument" | cut -f1 -d=)
-    value="${argument#*=}"
-    # sets e.g. ARG_port=8080
-    printf -v "ARG_${key//-/_}" '%s' "$value"
+    local key=$(echo $argument | cut -f1 -d=)
+    local key_length=${#key}
+    local value="${argument:$key_length+1}"
+    args["$key"]="$value"
   done
-}
 }
 
 assert_root() {
